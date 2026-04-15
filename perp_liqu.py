@@ -7,6 +7,7 @@ from typing import Union
 from urllib.parse import urlencode
 from datetime import datetime
 import os
+from __future__ import annotations
 
 # ============================================================
 #  CONFIG
