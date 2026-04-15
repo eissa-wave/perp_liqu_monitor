@@ -22,7 +22,7 @@ BINANCE_BASE = "https://fapi.binance.com"
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
-LIQ_THRESHOLD_PCT = 200.0   # alert when distance-to-liq < this %
+LIQ_THRESHOLD_PCT = 12.0   # alert when distance-to-liq < this %
 TIMEOUT = 15
 RETRIES = 4
 BACKOFF_S = 0.4
