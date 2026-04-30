@@ -37,7 +37,7 @@ def _send_slack_alert(alerts: list[dict]):
         return
 
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    header = f":rotating_light: *Liquidation Warning* — {ts}"
+    header = f":rotating_light: *Liquidation Warning* - {ts}"
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "Liquidation Warning"}},
@@ -47,6 +47,7 @@ def _send_slack_alert(alerts: list[dict]):
     for a in alerts:
         fields_text = (
             f"*{a['exchange']}  |  {a['symbol']}  ({a['direction']})*\n"
+            f"Size: `{a['size']:,.4f}`    Notional: `${a['notional_usd']:,.0f}`\n"
             f"Mark: `{a['mark']:,.6f}`    Liq: `{a['liq']:,.6f}`\n"
             f"Distance: *{a['dist_pct']:.2f}%*  (threshold: {LIQ_THRESHOLD_PCT}%)"
         )
@@ -129,11 +130,14 @@ def check_hl_liquidations() -> list[dict]:
             continue
 
         dist_pct = abs((mark_px - liq_px) / mark_px) * 100
+        notional = abs(szi) * mark_px
 
         results.append({
             "exchange": "Hyperliquid",
             "symbol": coin,
             "direction": direction,
+            "size": abs(szi),
+            "notional_usd": notional,
             "mark": mark_px,
             "liq": liq_px,
             "dist_pct": dist_pct,
@@ -180,11 +184,14 @@ def check_binance_liquidations() -> list[dict]:
             continue
 
         dist_pct = abs((mark - liq_px) / mark) * 100
+        notional = abs(amt) * mark
 
         results.append({
             "exchange": "Binance",
             "symbol": symbol,
             "direction": direction,
+            "size": abs(amt),
+            "notional_usd": notional,
             "mark": mark,
             "liq": liq_px,
             "dist_pct": dist_pct,
@@ -200,17 +207,24 @@ def _print_status(all_results: list[dict]):
     ts = datetime.utcnow().strftime("%H:%M:%S UTC")
     sorted_results = sorted(all_results, key=lambda r: r["dist_pct"])
 
-    print(f"\n{'='*72}")
+    print(f"\n{'='*108}")
     print(f"  Liquidation Distance Monitor  |  {ts}  |  threshold: {LIQ_THRESHOLD_PCT}%")
-    print(f"{'='*72}")
-    print(f"  {'Exchange':<14} {'Symbol':<14} {'Dir':<6} {'Mark':>14} {'Liq':>14} {'Dist':>8}")
-    print(f"  {'-'*14} {'-'*14} {'-'*6} {'-'*14} {'-'*14} {'-'*8}")
+    print(f"{'='*108}")
+    print(
+        f"  {'Exchange':<14} {'Symbol':<10} {'Dir':<6} "
+        f"{'Size':>14} {'Notional':>15} {'Mark':>12} {'Liq':>12} {'Dist':>8}"
+    )
+    print(
+        f"  {'-'*14} {'-'*10} {'-'*6} "
+        f"{'-'*14} {'-'*15} {'-'*12} {'-'*12} {'-'*8}"
+    )
 
     for r in sorted_results:
         flag = " <<" if r["dist_pct"] < LIQ_THRESHOLD_PCT else ""
         print(
-            f"  {r['exchange']:<14} {r['symbol']:<14} {r['direction']:<6} "
-            f"{r['mark']:>14,.4f} {r['liq']:>14,.4f} {r['dist_pct']:>7.2f}%{flag}"
+            f"  {r['exchange']:<14} {r['symbol']:<10} {r['direction']:<6} "
+            f"{r['size']:>14,.4f} ${r['notional_usd']:>14,.0f} "
+            f"{r['mark']:>12,.4f} {r['liq']:>12,.4f} {r['dist_pct']:>7.2f}%{flag}"
         )
 
     if not sorted_results:
