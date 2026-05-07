@@ -27,7 +27,7 @@ BYBIT_RECV_WINDOW = "5000"
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
-LIQ_THRESHOLD_PCT = 100.0   # alert when distance-to-liq < this %
+LIQ_THRESHOLD_PCT = 20.0   # alert when distance-to-liq < this %
 TIMEOUT = 15
 RETRIES = 4
 BACKOFF_S = 0.4
