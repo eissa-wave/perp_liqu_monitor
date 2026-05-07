@@ -4,7 +4,7 @@ import time
 import hmac
 import hashlib
 import json
-from typing import Union
+from typing import Union, Dict, Any
 from urllib.parse import urlencode
 from datetime import datetime
 import os
@@ -19,6 +19,11 @@ HL_DEX = ""
 BINANCE_KEY = os.environ.get("BINANCE_KEY")
 BINANCE_SECRET = os.environ.get("BINANCE_SECRET")
 BINANCE_BASE = "https://fapi.binance.com"
+
+BYBIT_KEY = os.environ.get("BYBIT_KEY")
+BYBIT_SECRET = os.environ.get("BYBIT_SECRET")
+BYBIT_BASE = "https://api.bybit.com"
+BYBIT_RECV_WINDOW = "5000"
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
@@ -201,6 +206,90 @@ def check_binance_liquidations() -> list[dict]:
 
 
 # ============================================================
+#  BYBIT
+# ============================================================
+def _bb_signed_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    timestamp = str(int(time.time() * 1000))
+    query_string = urlencode(params)
+    pre_sign = timestamp + BYBIT_KEY + BYBIT_RECV_WINDOW + query_string
+    signature = hmac.new(
+        BYBIT_SECRET.encode("utf-8"),
+        pre_sign.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "X-BAPI-API-KEY": BYBIT_KEY,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-RECV-WINDOW": BYBIT_RECV_WINDOW,
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.get(BYBIT_BASE + path, params=params, headers=headers, timeout=TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error {data.get('retCode')}: {data.get('retMsg')} (path={path})")
+    return data
+
+
+def check_bybit_liquidations() -> list[dict]:
+    results = []
+    for settle in ("USDT", "USDC"):
+        params: Dict[str, Any] = {
+            "category": "linear",
+            "settleCoin": settle,
+            "limit": "200",
+        }
+        cursor = None
+        while True:
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params.pop("cursor", None)
+
+            data = _bb_signed_get("/v5/position/list", params)
+            result = data.get("result", {})
+            rows = result.get("list", []) or []
+
+            for p in rows:
+                size = float(p.get("size", "0") or 0)
+                if size == 0:
+                    continue
+
+                symbol = p["symbol"]
+                side = p.get("side", "")
+                direction = "LONG" if side == "Buy" else "SHORT"
+                mark = float(p.get("markPrice", "0") or 0)
+                liq_px_str = p.get("liqPrice", "") or ""
+
+                if not liq_px_str or liq_px_str == "0" or mark == 0:
+                    continue
+
+                liq_px = float(liq_px_str)
+                dist_pct = abs((mark - liq_px) / mark) * 100
+                notional = size * mark
+
+                results.append({
+                    "exchange": "Bybit",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "size": size,
+                    "notional_usd": notional,
+                    "mark": mark,
+                    "liq": liq_px,
+                    "dist_pct": dist_pct,
+                })
+
+            cursor = result.get("nextPageCursor")
+            if not cursor:
+                break
+
+    return results
+
+
+# ============================================================
 #  STATUS TABLE (logged to Jenkins console)
 # ============================================================
 def _print_status(all_results: list[dict]):
@@ -252,6 +341,14 @@ def run():
             print(f"[Binance error] {exc}")
     else:
         print("  (Binance skipped, no API key configured)")
+
+    if BYBIT_KEY and BYBIT_SECRET:
+        try:
+            all_results += check_bybit_liquidations()
+        except Exception as exc:
+            print(f"[Bybit error] {exc}")
+    else:
+        print("  (Bybit skipped, no API key configured)")
 
     _print_status(all_results)
 
