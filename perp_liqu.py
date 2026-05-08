@@ -28,6 +28,7 @@ BYBIT_RECV_WINDOW = "5000"
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
 LIQ_THRESHOLD_PCT = 20.0   # alert when distance-to-liq < this %
+DELTA_THRESHOLD_USD = 1_000_000.0   # alert when |net delta| on any exchange > this
 TIMEOUT = 15
 RETRIES = 4
 BACKOFF_S = 0.4
@@ -75,6 +76,51 @@ def _send_slack_alert(alerts: list[dict]):
             print(f"[Slack error] status={resp.status_code} body={resp.text}")
         else:
             print(f"Slack alert sent for {len(alerts)} position(s).")
+    except requests.RequestException as exc:
+        print(f"[Slack error] {exc}")
+
+
+def _send_slack_delta_alert(breaches: list[dict]):
+    """Post a Slack message summarizing exchanges that breached the delta threshold."""
+    if not breaches:
+        return
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    header = f":warning: *Delta Exposure Warning* - {ts}"
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Delta Exposure Warning"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": ts}]},
+    ]
+
+    for b in breaches:
+        skew = "LONG" if b["net_delta_usd"] > 0 else "SHORT"
+        fields_text = (
+            f"*{b['exchange']}  ({skew} skew)*\n"
+            f"Net Delta: `${b['net_delta_usd']:,.0f}`\n"
+            f"Gross Long: `${b['gross_long_usd']:,.0f}`    "
+            f"Gross Short: `${b['gross_short_usd']:,.0f}`\n"
+            f"Threshold: `${DELTA_THRESHOLD_USD:,.0f}`"
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": fields_text}})
+        blocks.append({"type": "divider"})
+
+    payload = {
+        "text": header,
+        "blocks": blocks,
+    }
+
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=TIMEOUT,
+        )
+        if resp.status_code != 200:
+            print(f"[Slack error] status={resp.status_code} body={resp.text}")
+        else:
+            print(f"Slack delta alert sent for {len(breaches)} exchange(s).")
     except requests.RequestException as exc:
         print(f"[Slack error] {exc}")
 
@@ -136,6 +182,7 @@ def check_hl_liquidations() -> list[dict]:
 
         dist_pct = abs((mark_px - liq_px) / mark_px) * 100
         notional = abs(szi) * mark_px
+        signed_notional = szi * mark_px
 
         results.append({
             "exchange": "Hyperliquid",
@@ -143,6 +190,7 @@ def check_hl_liquidations() -> list[dict]:
             "direction": direction,
             "size": abs(szi),
             "notional_usd": notional,
+            "signed_notional_usd": signed_notional,
             "mark": mark_px,
             "liq": liq_px,
             "dist_pct": dist_pct,
@@ -190,6 +238,7 @@ def check_binance_liquidations() -> list[dict]:
 
         dist_pct = abs((mark - liq_px) / mark) * 100
         notional = abs(amt) * mark
+        signed_notional = amt * mark
 
         results.append({
             "exchange": "Binance",
@@ -197,6 +246,7 @@ def check_binance_liquidations() -> list[dict]:
             "direction": direction,
             "size": abs(amt),
             "notional_usd": notional,
+            "signed_notional_usd": signed_notional,
             "mark": mark,
             "liq": liq_px,
             "dist_pct": dist_pct,
@@ -270,6 +320,7 @@ def check_bybit_liquidations() -> list[dict]:
                 liq_px = float(liq_px_str)
                 dist_pct = abs((mark - liq_px) / mark) * 100
                 notional = size * mark
+                signed_notional = notional if direction == "LONG" else -notional
 
                 results.append({
                     "exchange": "Bybit",
@@ -277,6 +328,7 @@ def check_bybit_liquidations() -> list[dict]:
                     "direction": direction,
                     "size": size,
                     "notional_usd": notional,
+                    "signed_notional_usd": signed_notional,
                     "mark": mark,
                     "liq": liq_px,
                     "dist_pct": dist_pct,
@@ -287,6 +339,48 @@ def check_bybit_liquidations() -> list[dict]:
                 break
 
     return results
+
+
+# ============================================================
+#  DELTA AGGREGATION
+# ============================================================
+def _compute_exchange_deltas(all_results: list[dict]) -> list[dict]:
+    """Aggregate signed notional per exchange. Returns one row per exchange."""
+    by_exchange: Dict[str, Dict[str, float]] = {}
+    for r in all_results:
+        ex = r["exchange"]
+        signed = r.get("signed_notional_usd", 0.0)
+        bucket = by_exchange.setdefault(ex, {"net": 0.0, "long": 0.0, "short": 0.0})
+        bucket["net"] += signed
+        if signed > 0:
+            bucket["long"] += signed
+        else:
+            bucket["short"] += signed  # negative number
+
+    return [
+        {
+            "exchange": ex,
+            "net_delta_usd": v["net"],
+            "gross_long_usd": v["long"],
+            "gross_short_usd": v["short"],
+        }
+        for ex, v in by_exchange.items()
+    ]
+
+
+def _print_delta_summary(deltas: list[dict]):
+    print(f"\n{'-'*108}")
+    print(f"  Per-Exchange Net Delta  |  threshold: ${DELTA_THRESHOLD_USD:,.0f}")
+    print(f"{'-'*108}")
+    print(f"  {'Exchange':<14} {'Net Delta':>20} {'Gross Long':>20} {'Gross Short':>20}  Status")
+    for d in sorted(deltas, key=lambda x: -abs(x["net_delta_usd"])):
+        breached = abs(d["net_delta_usd"]) > DELTA_THRESHOLD_USD
+        flag = " <<" if breached else ""
+        print(
+            f"  {d['exchange']:<14} ${d['net_delta_usd']:>19,.0f} "
+            f"${d['gross_long_usd']:>19,.0f} ${d['gross_short_usd']:>19,.0f}{flag}"
+        )
+    print()
 
 
 # ============================================================
@@ -352,13 +446,21 @@ def run():
 
     _print_status(all_results)
 
-    # Filter for breached positions and fire Slack alert
+    # Liquidation distance alert
     breached = [r for r in all_results if r["dist_pct"] < LIQ_THRESHOLD_PCT]
-
     if breached:
         _send_slack_alert(breached)
     else:
-        print("All positions above threshold. No alerts fired.")
+        print("All positions above liq threshold. No liq alerts fired.")
+
+    # Delta exposure alert
+    deltas = _compute_exchange_deltas(all_results)
+    _print_delta_summary(deltas)
+    delta_breaches = [d for d in deltas if abs(d["net_delta_usd"]) > DELTA_THRESHOLD_USD]
+    if delta_breaches:
+        _send_slack_delta_alert(delta_breaches)
+    else:
+        print("All exchanges within delta threshold. No delta alerts fired.")
 
 
 if __name__ == "__main__":
