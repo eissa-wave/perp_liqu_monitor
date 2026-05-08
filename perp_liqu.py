@@ -27,8 +27,8 @@ BYBIT_RECV_WINDOW = "5000"
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
-LIQ_THRESHOLD_PCT = 100.0   # alert when distance-to-liq < this %
-DELTA_THRESHOLD_USD = 1_000_000.0   # alert when |net delta| on any exchange > this
+LIQ_THRESHOLD_PCT = 20.0   # alert when distance-to-liq < this %
+DELTA_THRESHOLD_USD = 6_000_000.0   # alert when |net delta| on any exchange > this
 TIMEOUT = 15
 RETRIES = 4
 BACKOFF_S = 0.4
