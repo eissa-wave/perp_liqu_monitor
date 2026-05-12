@@ -316,12 +316,18 @@ def check_binance_liquidations() -> list[dict]:
         mark = float(p["markPrice"])
         liq_px = float(p["liquidationPrice"])
 
-        if liq_px == 0 or mark == 0:
+        if mark == 0:
             continue
 
-        dist_pct = abs((mark - liq_px) / mark) * 100
         notional = abs(amt) * mark
         signed_notional = amt * mark
+
+        if liq_px == 0:
+            liq_out = None
+            dist_pct = None
+        else:
+            liq_out = liq_px
+            dist_pct = abs((mark - liq_px) / mark) * 100
 
         results.append({
             "exchange": "Binance",
@@ -331,7 +337,7 @@ def check_binance_liquidations() -> list[dict]:
             "notional_usd": notional,
             "signed_notional_usd": signed_notional,
             "mark": mark,
-            "liq": liq_px,
+            "liq": liq_out,
             "dist_pct": dist_pct,
         })
 
