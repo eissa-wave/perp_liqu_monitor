@@ -403,13 +403,18 @@ def check_bybit_liquidations() -> list[dict]:
                 mark = float(p.get("markPrice", "0") or 0)
                 liq_px_str = p.get("liqPrice", "") or ""
 
-                if not liq_px_str or liq_px_str == "0" or mark == 0:
+                if mark == 0:
                     continue
 
-                liq_px = float(liq_px_str)
-                dist_pct = abs((mark - liq_px) / mark) * 100
                 notional = size * mark
                 signed_notional = notional if direction == "LONG" else -notional
+
+                if not liq_px_str or liq_px_str == "0":
+                    liq_out = None
+                    dist_pct = None
+                else:
+                    liq_out = float(liq_px_str)
+                    dist_pct = abs((mark - liq_out) / mark) * 100
 
                 results.append({
                     "exchange": "Bybit",
@@ -419,7 +424,7 @@ def check_bybit_liquidations() -> list[dict]:
                     "notional_usd": notional,
                     "signed_notional_usd": signed_notional,
                     "mark": mark,
-                    "liq": liq_px,
+                    "liq": liq_out,
                     "dist_pct": dist_pct,
                 })
 
