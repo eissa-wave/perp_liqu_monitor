@@ -32,11 +32,11 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
 # OKX cross-margin uses account-level mgnRatio (adjEq / mmr); liquidation at <=1.0.
 # 1.33 ~= 25% equity buffer above mmr.
-OKX_MGN_RATIO_FLOOR = 8.33
+OKX_MGN_RATIO_FLOOR = 1.33
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
-LIQ_THRESHOLD_PCT = 200.0   # alert when distance-to-liq < this %
+LIQ_THRESHOLD_PCT = 20.0   # alert when distance-to-liq < this %
 DELTA_THRESHOLD_USD = 6_000_000.0   # alert when |net delta| on any exchange > this
 TIMEOUT = 15
 RETRIES = 4
@@ -134,29 +134,62 @@ def _send_slack_delta_alert(breaches: list[dict]):
         print(f"[Slack error] {exc}")
 
 
-def _send_slack_okx_mgn_alert(mgn_breach: dict):
+def _send_slack_okx_mgn_alert(mgn_breach: dict, cross_positions: list[dict]):
     """Post a Slack message when OKX cross-margin mgnRatio breaches the floor."""
     if not mgn_breach:
         return
 
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    header = f":rotating_light: *OKX Margin Ratio Warning* - {ts}"
+    header = f":rotating_light: *OKX Liquidation Warning* - {ts}"
+
+    mgn_ratio = mgn_breach['mgn_ratio']
+    # mgnRatio = adjEq / mmr. Liquidation begins at mgnRatio = 1.0.
+    # The "buffer above liq" expressed as a multiplier: how many times equity
+    # exceeds the maintenance requirement.
+    if mgn_ratio > 0:
+        ratio_above_liq = mgn_ratio  # e.g. 6.58x means equity is 6.58x mmr
+    else:
+        ratio_above_liq = 0.0
 
     fields_text = (
         f"*OKX cross-margin account*\n"
-        f"mgnRatio: *{mgn_breach['mgn_ratio']:.2f}*  (floor: {OKX_MGN_RATIO_FLOOR:.2f})\n"
+        f"mgnRatio: *{mgn_ratio:.2f}x*  (floor: {OKX_MGN_RATIO_FLOOR:.2f}x, "
+        f"account liquidates at 1.00x)\n"
+        f"Account is *{ratio_above_liq:.2f}x* equity-to-maintenance, "
+        f"i.e. {(ratio_above_liq - 1.0):.2f}x above the liquidation boundary\n"
         f"adjEq: `${mgn_breach['adj_eq']:,.0f}`    "
         f"mmr: `${mgn_breach['mmr']:,.0f}`\n"
-        f"Cross positions: `{mgn_breach['cross_pos_count']}`\n"
-        f"_Note: OKX does not return per-position liq prices for cross positions; "
-        f"safety is evaluated at account level._"
+        f"Cross positions: `{mgn_breach['cross_pos_count']}`"
     )
 
     blocks = [
-        {"type": "header", "text": {"type": "plain_text", "text": "OKX Margin Ratio Warning"}},
+        {"type": "header", "text": {"type": "plain_text", "text": "OKX Liquidation Warning"}},
         {"type": "context", "elements": [{"type": "mrkdwn", "text": ts}]},
         {"type": "section", "text": {"type": "mrkdwn", "text": fields_text}},
     ]
+
+    # Open cross positions
+    if cross_positions:
+        pos_lines = ["*Open cross positions:*"]
+        for p in cross_positions:
+            pos_lines.append(
+                f"`{p['symbol']}` ({p['direction']})  "
+                f"Size: `{p['size']:,.4f}`    "
+                f"Notional: `${p['notional_usd']:,.0f}`    "
+                f"Mark: `{p['mark']:,.6f}`"
+            )
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n".join(pos_lines)},
+        })
+
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": (
+            "_Note: OKX does not return per-position liq prices for cross positions; "
+            "safety is evaluated at account level via mgnRatio._"
+        )}],
+    })
 
     payload = {"text": header, "blocks": blocks}
 
@@ -170,7 +203,7 @@ def _send_slack_okx_mgn_alert(mgn_breach: dict):
         if resp.status_code != 200:
             print(f"[Slack error] status={resp.status_code} body={resp.text}")
         else:
-            print("Slack OKX mgnRatio alert sent.")
+            print("Slack OKX liquidation alert sent.")
     except requests.RequestException as exc:
         print(f"[Slack error] {exc}")
 
@@ -579,10 +612,15 @@ def _print_delta_summary(deltas: list[dict]):
 # ============================================================
 def _print_status(all_results: list[dict], okx_mgn_status: dict | None):
     ts = datetime.utcnow().strftime("%H:%M:%S UTC")
-    # Split rows with a measurable distance from those without (OKX cross).
-    measurable = [r for r in all_results if r.get("dist_pct") is not None]
+    # Sort all rows: measurable (have dist_pct) first by ascending distance,
+    # unmeasurable (OKX cross) at the bottom so the tightest positions are
+    # always visible at the top.
+    measurable = sorted(
+        [r for r in all_results if r.get("dist_pct") is not None],
+        key=lambda r: r["dist_pct"],
+    )
     unmeasurable = [r for r in all_results if r.get("dist_pct") is None]
-    sorted_results = sorted(measurable, key=lambda r: r["dist_pct"])
+    sorted_results = measurable + unmeasurable
 
     print(f"\n{'='*108}")
     print(f"  Liquidation Distance Monitor  |  {ts}  |  threshold: {LIQ_THRESHOLD_PCT}%")
@@ -597,31 +635,32 @@ def _print_status(all_results: list[dict], okx_mgn_status: dict | None):
     )
 
     for r in sorted_results:
-        flag = " <<" if r["dist_pct"] < LIQ_THRESHOLD_PCT else ""
-        print(
-            f"  {r['exchange']:<14} {r['symbol']:<16} {r['direction']:<6} "
-            f"{r['size']:>14,.4f} ${r['notional_usd']:>14,.0f} "
-            f"{r['mark']:>12,.4f} {r['liq']:>12,.4f} {r['dist_pct']:>7.2f}%{flag}"
-        )
-
-    if not sorted_results and not unmeasurable:
-        print("  (no open positions)")
-
-    if unmeasurable:
-        print(f"\n  OKX cross positions (no per-position liq; account-level mgnRatio applies):")
-        for r in unmeasurable:
+        if r.get("dist_pct") is None:
+            # OKX cross: no per-position liq; safety via account mgnRatio
             print(
                 f"  {r['exchange']:<14} {r['symbol']:<16} {r['direction']:<6} "
                 f"{r['size']:>14,.4f} ${r['notional_usd']:>14,.0f} "
-                f"{r['mark']:>12,.4f} {'--':>12} {'--':>8}"
+                f"{r['mark']:>12,.4f} {'--':>12} {'--':>8}  (cross, see mgnRatio)"
             )
+        else:
+            flag = " <<" if r["dist_pct"] < LIQ_THRESHOLD_PCT else ""
+            print(
+                f"  {r['exchange']:<14} {r['symbol']:<16} {r['direction']:<6} "
+                f"{r['size']:>14,.4f} ${r['notional_usd']:>14,.0f} "
+                f"{r['mark']:>12,.4f} {r['liq']:>12,.4f} {r['dist_pct']:>7.2f}%{flag}"
+            )
+
+    if not sorted_results:
+        print("  (no open positions)")
 
     if okx_mgn_status:
         s = okx_mgn_status
         flag = " <<" if s["breached"] else ""
-        print(f"\n  OKX account mgnRatio: {s['mgn_ratio']:.2f}  "
-              f"(floor: {OKX_MGN_RATIO_FLOOR:.2f},  adjEq: ${s['adj_eq']:,.0f},  "
-              f"mmr: ${s['mmr']:,.0f}){flag}")
+        print(
+            f"\n  OKX account mgnRatio: {s['mgn_ratio']:.2f}x  "
+            f"(floor: {OKX_MGN_RATIO_FLOOR:.2f}x, liquidates at 1.00x,  "
+            f"adjEq: ${s['adj_eq']:,.0f},  mmr: ${s['mmr']:,.0f}){flag}"
+        )
     print()
 
 
@@ -678,11 +717,15 @@ def run():
 
     # OKX cross-margin mgnRatio alert
     if okx_mgn_status and okx_mgn_status["breached"]:
-        _send_slack_okx_mgn_alert(okx_mgn_status)
+        okx_cross_positions = [
+            r for r in all_results
+            if r["exchange"] == "OKX" and r.get("dist_pct") is None
+        ]
+        _send_slack_okx_mgn_alert(okx_mgn_status, okx_cross_positions)
     elif okx_mgn_status:
         print(
-            f"OKX mgnRatio {okx_mgn_status['mgn_ratio']:.2f} above floor "
-            f"{OKX_MGN_RATIO_FLOOR:.2f}. No OKX mgnRatio alert fired."
+            f"OKX mgnRatio {okx_mgn_status['mgn_ratio']:.2f}x above floor "
+            f"{OKX_MGN_RATIO_FLOOR:.2f}x. No OKX liquidation alert fired."
         )
 
     # Delta exposure alert
