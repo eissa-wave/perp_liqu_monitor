@@ -35,7 +35,7 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
 # OKX cross-margin uses account-level mgnRatio (adjEq / mmr); liquidation at <=1.0.
 # 1.33 ~= 25% equity buffer above mmr.
-OKX_MGN_RATIO_FLOOR = 8.5
+OKX_MGN_RATIO_FLOOR = 1.5
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
@@ -47,7 +47,7 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 
-LIQ_THRESHOLD_PCT = 200.0   # alert when distance-to-liq < this %
+LIQ_THRESHOLD_PCT = 25.0   # alert when distance-to-liq < this %
 DELTA_THRESHOLD_USD = 6_000_000.0   # alert when |net delta| on any exchange > this
 TIMEOUT = 15
 RETRIES = 4
