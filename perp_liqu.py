@@ -5,6 +5,9 @@ import hmac
 import hashlib
 import base64
 import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Union, Dict, Any
 from urllib.parse import urlencode
 from datetime import datetime, timezone
@@ -32,11 +35,19 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
 # OKX cross-margin uses account-level mgnRatio (adjEq / mmr); liquidation at <=1.0.
 # 1.33 ~= 25% equity buffer above mmr.
-OKX_MGN_RATIO_FLOOR = 1.5
+OKX_MGN_RATIO_FLOOR = 8.5
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
-LIQ_THRESHOLD_PCT = 20.0   # alert when distance-to-liq < this %
+# Email config
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
+EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
+
+LIQ_THRESHOLD_PCT = 200.0   # alert when distance-to-liq < this %
 DELTA_THRESHOLD_USD = 6_000_000.0   # alert when |net delta| on any exchange > this
 TIMEOUT = 15
 RETRIES = 4
@@ -44,10 +55,35 @@ BACKOFF_S = 0.4
 
 
 # ============================================================
+#  EMAIL HELPER
+# ============================================================
+def _send_email(subject: str, html_body: str, text_body: str):
+    """Send a plaintext+HTML email. Silently no-ops if SMTP not configured."""
+    if not (SMTP_USER and SMTP_PASSWORD and EMAIL_TO):
+        return
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(EMAIL_TO)
+    msg.attach(MIMEText(text_body, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASSWORD)
+            s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        print(f"Email alert sent to {len(EMAIL_TO)} recipient(s): {subject}")
+    except Exception as exc:
+        print(f"[Email error] {exc}")
+
+
+# ============================================================
 #  SLACK
 # ============================================================
 def _send_slack_alert(alerts: list[dict]):
-    """Post a single Slack message summarizing all breached positions."""
+    """Post a single Slack message summarizing all breached positions, and mirror via email."""
     if not alerts:
         return
 
@@ -70,7 +106,7 @@ def _send_slack_alert(alerts: list[dict]):
         blocks.append({"type": "divider"})
 
     payload = {
-        "text": header,          # fallback for notifications
+        "text": header,
         "blocks": blocks,
     }
 
@@ -88,9 +124,37 @@ def _send_slack_alert(alerts: list[dict]):
     except requests.RequestException as exc:
         print(f"[Slack error] {exc}")
 
+    # ---- email mirror ----
+    subject = f"[Liq Warning] {len(alerts)} position(s) within {LIQ_THRESHOLD_PCT}% of liq"
+    rows_html = "".join(
+        f"<tr><td>{a['exchange']}</td><td>{a['symbol']}</td><td>{a['direction']}</td>"
+        f"<td align='right'>{a['size']:,.4f}</td>"
+        f"<td align='right'>${a['notional_usd']:,.0f}</td>"
+        f"<td align='right'>{a['mark']:,.6f}</td>"
+        f"<td align='right'>{a['liq']:,.6f}</td>"
+        f"<td align='right'><b>{a['dist_pct']:.2f}%</b></td></tr>"
+        for a in alerts
+    )
+    html = f"""
+    <h3>Liquidation Warning &ndash; {ts}</h3>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:monospace'>
+      <tr><th>Exchange</th><th>Symbol</th><th>Dir</th><th>Size</th>
+          <th>Notional</th><th>Mark</th><th>Liq</th><th>Dist</th></tr>
+      {rows_html}
+    </table>
+    <p>Threshold: {LIQ_THRESHOLD_PCT}%</p>
+    """
+    text = "\n".join(
+        f"{a['exchange']} {a['symbol']} {a['direction']} "
+        f"dist={a['dist_pct']:.2f}% notional=${a['notional_usd']:,.0f} "
+        f"mark={a['mark']:,.6f} liq={a['liq']:,.6f}"
+        for a in alerts
+    )
+    _send_email(subject, html, text)
+
 
 def _send_slack_delta_alert(breaches: list[dict]):
-    """Post a Slack message summarizing exchanges that breached the delta threshold."""
+    """Post a Slack message summarizing exchanges that breached the delta threshold, and mirror via email."""
     if not breaches:
         return
 
@@ -133,9 +197,36 @@ def _send_slack_delta_alert(breaches: list[dict]):
     except requests.RequestException as exc:
         print(f"[Slack error] {exc}")
 
+    # ---- email mirror ----
+    subject = f"[Delta Warning] {len(breaches)} exchange(s) above ${DELTA_THRESHOLD_USD:,.0f}"
+    rows_html = "".join(
+        f"<tr><td>{b['exchange']}</td>"
+        f"<td>{'LONG' if b['net_delta_usd'] > 0 else 'SHORT'}</td>"
+        f"<td align='right'><b>${b['net_delta_usd']:,.0f}</b></td>"
+        f"<td align='right'>${b['gross_long_usd']:,.0f}</td>"
+        f"<td align='right'>${b['gross_short_usd']:,.0f}</td></tr>"
+        for b in breaches
+    )
+    html = f"""
+    <h3>Delta Exposure Warning &ndash; {ts}</h3>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:monospace'>
+      <tr><th>Exchange</th><th>Skew</th><th>Net Delta</th>
+          <th>Gross Long</th><th>Gross Short</th></tr>
+      {rows_html}
+    </table>
+    <p>Threshold: ${DELTA_THRESHOLD_USD:,.0f}</p>
+    """
+    text = "\n".join(
+        f"{b['exchange']} {'LONG' if b['net_delta_usd'] > 0 else 'SHORT'} "
+        f"net=${b['net_delta_usd']:,.0f} long=${b['gross_long_usd']:,.0f} "
+        f"short=${b['gross_short_usd']:,.0f}"
+        for b in breaches
+    )
+    _send_email(subject, html, text)
+
 
 def _send_slack_okx_mgn_alert(mgn_breach: dict, cross_positions: list[dict]):
-    """Post a Slack message when OKX cross-margin mgnRatio breaches the floor."""
+    """Post a Slack message when OKX cross-margin mgnRatio breaches the floor, and mirror via email."""
     if not mgn_breach:
         return
 
@@ -143,11 +234,8 @@ def _send_slack_okx_mgn_alert(mgn_breach: dict, cross_positions: list[dict]):
     header = f":rotating_light: *OKX Liquidation Warning* - {ts}"
 
     mgn_ratio = mgn_breach['mgn_ratio']
-    # mgnRatio = adjEq / mmr. Liquidation begins at mgnRatio = 1.0.
-    # The "buffer above liq" expressed as a multiplier: how many times equity
-    # exceeds the maintenance requirement.
     if mgn_ratio > 0:
-        ratio_above_liq = mgn_ratio  # e.g. 6.58x means equity is 6.58x mmr
+        ratio_above_liq = mgn_ratio
     else:
         ratio_above_liq = 0.0
 
@@ -168,7 +256,6 @@ def _send_slack_okx_mgn_alert(mgn_breach: dict, cross_positions: list[dict]):
         {"type": "section", "text": {"type": "mrkdwn", "text": fields_text}},
     ]
 
-    # Open cross positions
     if cross_positions:
         pos_lines = ["*Open cross positions:*"]
         for p in cross_positions:
@@ -206,6 +293,59 @@ def _send_slack_okx_mgn_alert(mgn_breach: dict, cross_positions: list[dict]):
             print("Slack OKX liquidation alert sent.")
     except requests.RequestException as exc:
         print(f"[Slack error] {exc}")
+
+    # ---- email mirror ----
+    subject = f"[OKX Liq Warning] mgnRatio {mgn_ratio:.2f}x below floor {OKX_MGN_RATIO_FLOOR:.2f}x"
+
+    pos_rows_html = ""
+    if cross_positions:
+        pos_rows_html = "<h4>Open cross positions</h4>" + (
+            "<table border='1' cellpadding='6' cellspacing='0' "
+            "style='border-collapse:collapse;font-family:monospace'>"
+            "<tr><th>Symbol</th><th>Dir</th><th>Size</th><th>Notional</th><th>Mark</th></tr>"
+            + "".join(
+                f"<tr><td>{p['symbol']}</td><td>{p['direction']}</td>"
+                f"<td align='right'>{p['size']:,.4f}</td>"
+                f"<td align='right'>${p['notional_usd']:,.0f}</td>"
+                f"<td align='right'>{p['mark']:,.6f}</td></tr>"
+                for p in cross_positions
+            )
+            + "</table>"
+        )
+
+    html = f"""
+    <h3>OKX Liquidation Warning &ndash; {ts}</h3>
+    <p><b>OKX cross-margin account</b></p>
+    <ul>
+      <li>mgnRatio: <b>{mgn_ratio:.2f}x</b> (floor: {OKX_MGN_RATIO_FLOOR:.2f}x, liquidates at 1.00x)</li>
+      <li>Equity-to-maintenance: <b>{ratio_above_liq:.2f}x</b>
+          ({(ratio_above_liq - 1.0):.2f}x above liquidation boundary)</li>
+      <li>adjEq: ${mgn_breach['adj_eq']:,.0f}</li>
+      <li>mmr: ${mgn_breach['mmr']:,.0f}</li>
+      <li>Cross positions: {mgn_breach['cross_pos_count']}</li>
+    </ul>
+    {pos_rows_html}
+    <p><i>Note: OKX does not return per-position liq prices for cross positions;
+    safety is evaluated at account level via mgnRatio.</i></p>
+    """
+
+    text_lines = [
+        f"OKX cross-margin account mgnRatio: {mgn_ratio:.2f}x "
+        f"(floor: {OKX_MGN_RATIO_FLOOR:.2f}x, liquidates at 1.00x)",
+        f"adjEq: ${mgn_breach['adj_eq']:,.0f}    mmr: ${mgn_breach['mmr']:,.0f}",
+        f"Cross positions: {mgn_breach['cross_pos_count']}",
+    ]
+    if cross_positions:
+        text_lines.append("")
+        text_lines.append("Open cross positions:")
+        for p in cross_positions:
+            text_lines.append(
+                f"  {p['symbol']} {p['direction']} "
+                f"size={p['size']:,.4f} notional=${p['notional_usd']:,.0f} "
+                f"mark={p['mark']:,.6f}"
+            )
+    text = "\n".join(text_lines)
+    _send_email(subject, html, text)
 
 
 # ============================================================
@@ -532,8 +672,6 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
                 "dist_pct": dist_pct,
             })
         else:
-            # Cross (or isolated with no liq px). Emit a row with dist_pct=None
-            # so delta aggregation captures it but the liq alert filter drops it.
             cross_pos_count += 1
             results.append({
                 "exchange": "OKX",
@@ -547,7 +685,6 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
                 "dist_pct": None,
             })
 
-    # Account-level mgnRatio (cross-margin safety)
     mgn_status = None
     if cross_pos_count > 0:
         acct_resp = _okx_signed_get("/api/v5/account/balance")
@@ -590,7 +727,7 @@ def _compute_exchange_deltas(all_results: list[dict]) -> list[dict]:
         if signed > 0:
             bucket["long"] += signed
         else:
-            bucket["short"] += signed  # negative number
+            bucket["short"] += signed
 
     return [
         {
@@ -623,9 +760,6 @@ def _print_delta_summary(deltas: list[dict]):
 # ============================================================
 def _print_status(all_results: list[dict], okx_mgn_status: dict | None):
     ts = datetime.utcnow().strftime("%H:%M:%S UTC")
-    # Sort all rows: measurable (have dist_pct) first by ascending distance,
-    # unmeasurable (OKX cross) at the bottom so the tightest positions are
-    # always visible at the top.
     measurable = sorted(
         [r for r in all_results if r.get("dist_pct") is not None],
         key=lambda r: r["dist_pct"],
@@ -647,7 +781,6 @@ def _print_status(all_results: list[dict], okx_mgn_status: dict | None):
 
     for r in sorted_results:
         if r.get("dist_pct") is None:
-            # OKX cross: no per-position liq; safety via account mgnRatio
             print(
                 f"  {r['exchange']:<14} {r['symbol']:<16} {r['direction']:<6} "
                 f"{r['size']:>14,.4f} ${r['notional_usd']:>14,.0f} "
@@ -716,7 +849,6 @@ def run():
 
     _print_status(all_results, okx_mgn_status)
 
-    # Liquidation distance alert (only positions with a measurable distance)
     breached = [
         r for r in all_results
         if r.get("dist_pct") is not None and r["dist_pct"] < LIQ_THRESHOLD_PCT
@@ -726,7 +858,6 @@ def run():
     else:
         print("All positions above liq threshold. No liq alerts fired.")
 
-    # OKX cross-margin mgnRatio alert
     if okx_mgn_status and okx_mgn_status["breached"]:
         okx_cross_positions = [
             r for r in all_results
@@ -739,7 +870,6 @@ def run():
             f"{OKX_MGN_RATIO_FLOOR:.2f}x. No OKX liquidation alert fired."
         )
 
-    # Delta exposure alert
     deltas = _compute_exchange_deltas(all_results)
     _print_delta_summary(deltas)
     delta_breaches = [d for d in deltas if abs(d["net_delta_usd"]) > DELTA_THRESHOLD_USD]
