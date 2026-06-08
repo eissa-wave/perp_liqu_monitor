@@ -47,7 +47,7 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", SMTP_USER)
 EMAIL_TO = [x.strip() for x in os.environ.get("EMAIL_TO", "").split(",") if x.strip()]
 
-LIQ_THRESHOLD_PCT = 25.0   # alert when distance-to-liq < this %
+LIQ_THRESHOLD_PCT = 250.0   # alert when distance-to-liq < this %
 DELTA_THRESHOLD_USD = 7_500_000.0   # alert when |net delta| on any exchange > this
 TIMEOUT = 15
 RETRIES = 4
