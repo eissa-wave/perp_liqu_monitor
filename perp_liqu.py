@@ -18,7 +18,9 @@ import os
 # ============================================================
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 HL_USER = os.environ.get("HL_USER")
-HL_DEX = ""
+# DEXs to query. "" is the main validator-operated perp dex.
+# Add HIP-3 builder dex names (e.g. "xyz" for xyz:CL). Comma-separated env override.
+HL_DEXS = [d.strip() for d in os.environ.get("HL_DEXS", ",xyz").split(",")]
 
 BINANCE_KEY = os.environ.get("BINANCE_KEY")
 BINANCE_SECRET = os.environ.get("BINANCE_SECRET")
@@ -367,15 +369,18 @@ def _hl_post(payload: dict) -> Union[list, dict]:
             time.sleep(BACKOFF_S * (2 ** attempt))
 
 
-def check_hl_liquidations() -> list[dict]:
+def _check_hl_dex(dex: str) -> list[dict]:
+    """Query one HL perp dex. dex="" is the main validator-operated dex; a
+    non-empty name is a HIP-3 builder dex (independent margining). Symbols on a
+    builder dex are prefixed dex:coin (e.g. xyz:CL) to match the frontend."""
     ch_payload = {"type": "clearinghouseState", "user": HL_USER}
-    if HL_DEX:
-        ch_payload["dex"] = HL_DEX
+    if dex:
+        ch_payload["dex"] = dex
     state = _hl_post(ch_payload)
 
     meta_payload = {"type": "metaAndAssetCtxs"}
-    if HL_DEX:
-        meta_payload["dex"] = HL_DEX
+    if dex:
+        meta_payload["dex"] = dex
     meta_resp = _hl_post(meta_payload)
 
     universe = meta_resp[0]["universe"]
@@ -383,6 +388,8 @@ def check_hl_liquidations() -> list[dict]:
     mark_prices = {}
     for asset, ctx in zip(universe, ctxs):
         mark_prices[asset["name"]] = float(ctx["markPx"])
+
+    prefix = f"{dex}:" if dex else ""
 
     results = []
     for ap in state.get("assetPositions", []):
@@ -409,7 +416,7 @@ def check_hl_liquidations() -> list[dict]:
 
         results.append({
             "exchange": "Hyperliquid",
-            "symbol": coin,
+            "symbol": f"{prefix}{coin}",
             "direction": direction,
             "size": abs(szi),
             "notional_usd": notional,
@@ -419,6 +426,18 @@ def check_hl_liquidations() -> list[dict]:
             "dist_pct": dist_pct,
         })
 
+    return results
+
+
+def check_hl_liquidations() -> list[dict]:
+    """Aggregate positions across every configured HL dex (main + HIP-3 builders).
+    Each dex margins independently, so they are queried separately and merged."""
+    results = []
+    for dex in HL_DEXS:
+        try:
+            results += _check_hl_dex(dex)
+        except Exception as exc:
+            print(f"[HL error] dex={dex or '(main)'}: {exc}")
     return results
 
 
