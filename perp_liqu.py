@@ -37,7 +37,7 @@ OKX_PASSPHRASE = os.environ.get("OKX_PASSPHRASE")
 OKX_BASE = "https://www.okx.com"
 # OKX cross-margin uses account-level mgnRatio (adjEq / mmr); liquidation at <=1.0.
 # 1.33 ~= 25% equity buffer above mmr.
-OKX_MGN_RATIO_FLOOR = 1.5
+OKX_MGN_RATIO_FLOOR = 1.4
 
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
