@@ -646,6 +646,10 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
 
     mgn_status is a dict with account-level cross margin health, or None if there
     are no cross positions.
+
+    Rows also carry pos_mmr (the position's maintenance margin requirement in
+    USD), used by the vol check to back out an implied liq distance for cross
+    positions from the account mgnRatio.
     """
     pos_resp = _okx_signed_get("/api/v5/account/positions")
     raw_positions = pos_resp.get("data", []) or []
@@ -675,6 +679,10 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
         liq_px_str = p.get("liqPx", "") or ""
         mgn_mode = (p.get("mgnMode", "") or "").lower()
         is_isolated = mgn_mode == "isolated"
+        try:
+            pos_mmr = float(p.get("mmr") or 0)
+        except (TypeError, ValueError):
+            pos_mmr = 0.0
 
         if is_isolated and liq_px_str and liq_px_str not in ("", "0") and mark != 0:
             liq_px = float(liq_px_str)
@@ -689,6 +697,7 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
                 "mark": mark,
                 "liq": liq_px,
                 "dist_pct": dist_pct,
+                "pos_mmr": pos_mmr,
             })
         else:
             cross_pos_count += 1
@@ -702,6 +711,7 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
                 "mark": mark,
                 "liq": None,
                 "dist_pct": None,
+                "pos_mmr": pos_mmr,
             })
 
     mgn_status = None
@@ -730,6 +740,357 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
         }
 
     return results, mgn_status
+
+
+# ============================================================
+#  VOLATILITY-BASED LEVERAGE CHECK
+# ============================================================
+# Independent of the fixed LIQ_THRESHOLD_PCT check above. For each position we
+# estimate recent realized vol (EWMA-weighted daily, most recent day heaviest)
+# and require the distance-to-liq to exceed VOL_BUFFER_SIGMAS daily sigmas:
+#     required_dist = VOL_BUFFER_SIGMAS * sigma
+#     recommended_leverage = 1 / (required_dist + VOL_MMR)
+# A position can be comfortably past the fixed 25% threshold and still breach
+# this check if the token's vol says the safe distance is larger.
+VOL_CHECK_ENABLED = True
+VOL_LOOKBACK_DAYS = 5
+VOL_HALFLIFE_DAYS = 1.0
+VOL_BUFFER_SIGMAS = 5.0
+VOL_MMR = 0.0
+VOL_LEV_MIN = 1.0
+VOL_LEV_MAX = 5.0
+# base ticker -> Binance USDT-M symbol override (else BASE + "USDT" is tried)
+VOL_SYMBOL_OVERRIDES = {}
+
+# ---- TEST ONLY: inject a dummy position to exercise the vol alert. ----
+# Set to False (or env VOL_TEST_POSITION=0) once verified. LAB at a fake 31%
+# distance-to-liq: passes the fixed 25% threshold but should breach the
+# vol-implied required distance if LAB's recent vol is high enough.
+VOL_TEST_POSITION = 1
+
+
+def _make_test_position() -> dict:
+    return {
+        "exchange": "TEST",
+        "symbol": "LAB",
+        "direction": "LONG",
+        "size": 100_000.0,
+        "notional_usd": 50_000.0,
+        "signed_notional_usd": 50_000.0,
+        "mark": 0.5,
+        "liq": 0.345,           # 31% below mark
+        "dist_pct": 31.0,       # fake distance-to-liq
+    }
+
+BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+
+
+def _vol_base_ticker(symbol: str) -> str:
+    """Normalize a venue symbol to its base asset (mirrors the sheet script):
+    xyz:CL -> CL, CL-USDT-SWAP -> CL, XMRUSDT -> XMR, XMR -> XMR."""
+    s = symbol or ""
+    if ":" in s:
+        s = s.split(":")[-1]
+    if "-" in s:
+        s = s.split("-")[0]
+    for q in ("USDT", "USDC", "USD"):
+        if s.endswith(q) and len(s) > len(q):
+            return s[: -len(q)]
+    return s
+
+
+def _fetch_daily_closes_binance(base: str) -> list[float] | None:
+    symbol = VOL_SYMBOL_OVERRIDES.get(base, f"{base}USDT")
+    params = {"symbol": symbol, "interval": "1d", "limit": VOL_LOOKBACK_DAYS + 2}
+    for attempt in range(RETRIES):
+        try:
+            r = requests.get(BINANCE_KLINES_URL, params=params, timeout=TIMEOUT)
+            if r.status_code in (418, 429, 500, 502, 503, 504):
+                time.sleep(BACKOFF_S * (2 ** attempt))
+                continue
+            if r.status_code == 400:
+                return None   # symbol doesn't exist on Binance futures
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict) or not data:
+                return None
+            return [float(k[4]) for k in data]
+        except (requests.RequestException, ValueError):
+            if attempt == RETRIES - 1:
+                return None
+            time.sleep(BACKOFF_S * (2 ** attempt))
+    return None
+
+
+def _fetch_daily_closes_hl(coin: str) -> list[float] | None:
+    """HL candleSnapshot fallback; works for main-dex coins and HIP-3 coins
+    (pass the prefixed name, e.g. xyz:CL)."""
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - (VOL_LOOKBACK_DAYS + 2) * 86_400_000
+    payload = {
+        "type": "candleSnapshot",
+        "req": {"coin": coin, "interval": "1d", "startTime": start_ms, "endTime": end_ms},
+    }
+    try:
+        data = _hl_post(payload)
+        if not isinstance(data, list) or not data:
+            return None
+        closes = [float(c.get("c")) for c in data if c.get("c") is not None]
+        return closes if len(closes) >= 3 else None
+    except Exception:
+        return None
+
+
+def _weighted_daily_vol(closes: list[float], halflife_days: float) -> tuple[float, float]:
+    """Returns (ewma_vol, simple_vol) of daily returns. Most recent day gets
+    the highest weight. Zero-mean assumption on the EWMA leg."""
+    rets = [closes[i] / closes[i - 1] - 1.0 for i in range(1, len(closes)) if closes[i - 1] != 0]
+    n = len(rets)
+    if n < 2:
+        raise ValueError("not enough returns")
+    decay = 0.5 ** (1.0 / halflife_days)
+    weights = [decay ** (n - 1 - i) for i in range(n)]   # i = n-1 is most recent
+    wsum = sum(weights)
+    ewma_var = sum(w * r * r for w, r in zip(weights, rets)) / wsum
+    mean = sum(rets) / n
+    simple_var = sum((r - mean) ** 2 for r in rets) / (n - 1)
+    return ewma_var ** 0.5, simple_var ** 0.5
+
+
+def _fetch_daily_closes_okx(base: str) -> list[float] | None:
+    """OKX public market candles fallback (no auth). Tries BASE-USDT-SWAP."""
+    inst_id = f"{base}-USDT-SWAP"
+    url = f"{OKX_BASE}/api/v5/market/candles"
+    params = {"instId": inst_id, "bar": "1D", "limit": str(VOL_LOOKBACK_DAYS + 2)}
+    try:
+        r = requests.get(url, params=params, timeout=TIMEOUT)
+        data = r.json()
+        if r.status_code != 200 or data.get("code") not in (None, "0"):
+            return None
+        rows = data.get("data", []) or []
+        if len(rows) < 3:
+            return None
+        # OKX returns newest-first; close is index 4. Reverse to oldest-first.
+        closes = [float(row[4]) for row in reversed(rows)]
+        return closes
+    except (requests.RequestException, ValueError, IndexError):
+        return None
+
+
+def _get_vol_for_base(base: str, hl_symbol_hint: str | None, cache: dict) -> dict | None:
+    """Resolve daily closes for a base ticker (Binance first, HL fallback) and
+    compute vol stats. Cached per base. hl_symbol_hint is the HL-native symbol
+    (e.g. xyz:CL) if the base was seen on an HL position."""
+    if base in cache:
+        return cache[base]
+
+    closes = _fetch_daily_closes_binance(base)
+    source = "Binance"
+    if closes is None:
+        candidates = []
+        if hl_symbol_hint:
+            candidates.append(hl_symbol_hint)
+        candidates.append(base)
+        for dex in HL_DEXS:
+            if dex:
+                candidates.append(f"{dex}:{base}")
+        seen = set()
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            closes = _fetch_daily_closes_hl(cand)
+            if closes is not None:
+                source = f"Hyperliquid ({cand})"
+                break
+    if closes is None:
+        closes = _fetch_daily_closes_okx(base)
+        if closes is not None:
+            source = f"OKX ({base}-USDT-SWAP)"
+
+    if closes is None or len(closes) < 3:
+        cache[base] = None
+        return None
+
+    try:
+        ewma_vol, simple_vol = _weighted_daily_vol(closes, VOL_HALFLIFE_DAYS)
+    except ValueError:
+        cache[base] = None
+        return None
+
+    required_dist = VOL_BUFFER_SIGMAS * ewma_vol           # fraction
+    denom = required_dist + VOL_MMR
+    raw_lev = float("inf") if denom <= 0 else 1.0 / denom
+    rec_lev = max(VOL_LEV_MIN, min(VOL_LEV_MAX, raw_lev))
+
+    out = {
+        "base": base,
+        "source": source,
+        "n_returns": len(closes) - 1,
+        "ewma_vol": ewma_vol,
+        "simple_vol": simple_vol,
+        "required_dist_pct": required_dist * 100.0,
+        "raw_leverage": raw_lev,
+        "recommended_leverage": rec_lev,
+    }
+    cache[base] = out
+    return out
+
+
+def _okx_implied_cross_dist(direction: str, mgn_ratio: float, pos_mmr: float,
+                            notional: float) -> float | None:
+    """Implied distance-to-liq for an OKX cross position, backed out from the
+    account mgnRatio and the position's maintenance rate m = mmr/notional.
+    Single-position closed form; with multiple cross positions sharing the
+    account it is an approximation (shared adjEq/mmr pool).
+      long:  dist = m*(R-1)/(1-m)
+      short: dist = m*(R-1)/(1+m)"""
+    if mgn_ratio <= 1.0 or notional <= 0 or pos_mmr <= 0:
+        return None
+    m = pos_mmr / notional
+    if m >= 1.0:
+        return None
+    if direction == "LONG":
+        return m * (mgn_ratio - 1.0) / (1.0 - m) * 100.0
+    return m * (mgn_ratio - 1.0) / (1.0 + m) * 100.0
+
+
+def check_vol_leverage(all_results: list[dict], okx_mgn_status: dict | None) -> list[dict]:
+    """Compare each position's distance-to-liq against its vol-implied required
+    distance. Returns breach dicts with vol context."""
+    if not VOL_CHECK_ENABLED:
+        return []
+
+    vol_cache: dict = {}
+    breaches = []
+
+    for r in all_results:
+        base = _vol_base_ticker(r["symbol"])
+        hl_hint = r["symbol"] if r["exchange"] == "Hyperliquid" else None
+        vol = _get_vol_for_base(base, hl_hint, vol_cache)
+        if vol is None:
+            print(f"  [vol check] no price history for {r['symbol']} (base {base}); skipped")
+            continue
+
+        dist_pct = r.get("dist_pct")
+        dist_source = "exchange liq price"
+
+        if dist_pct is None and r["exchange"] == "OKX" and okx_mgn_status:
+            pos_mmr = r.get("pos_mmr") or 0.0
+            dist_pct = _okx_implied_cross_dist(
+                r["direction"], okx_mgn_status["mgn_ratio"], pos_mmr, r["notional_usd"]
+            )
+            dist_source = "implied from OKX mgnRatio (approx)"
+
+        if dist_pct is None:
+            print(f"  [vol check] no liq distance available for {r['exchange']} {r['symbol']}; skipped")
+            continue
+
+        required = vol["required_dist_pct"]
+        if dist_pct < required:
+            implied_current_lev = 100.0 / dist_pct if dist_pct > 0 else float("inf")
+            breaches.append({
+                "exchange": r["exchange"],
+                "symbol": r["symbol"],
+                "direction": r["direction"],
+                "notional_usd": r["notional_usd"],
+                "dist_pct": dist_pct,
+                "dist_source": dist_source,
+                "required_dist_pct": required,
+                "ewma_vol_pct": vol["ewma_vol"] * 100.0,
+                "simple_vol_pct": vol["simple_vol"] * 100.0,
+                "n_returns": vol["n_returns"],
+                "vol_source": vol["source"],
+                "recommended_leverage": vol["recommended_leverage"],
+                "implied_current_leverage": implied_current_lev,
+            })
+
+    return breaches
+
+
+def _send_slack_vol_alert(breaches: list[dict]):
+    """Slack + email alert for positions whose liq distance is inside the
+    vol-implied safe distance."""
+    if not breaches:
+        return
+
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    header = f":chart_with_downwards_trend: *Volatility Leverage Warning* - {ts}"
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Volatility Leverage Warning"}},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": ts}]},
+        {"type": "section", "text": {"type": "mrkdwn", "text": (
+            f"_Distance-to-liq is inside the vol-implied safe distance "
+            f"({VOL_BUFFER_SIGMAS:.0f} weighted daily sigmas). "
+            f"*Add collateral or reduce leverage* on the positions below._"
+        )}},
+    ]
+
+    for b in breaches:
+        fields_text = (
+            f"*{b['exchange']}  |  {b['symbol']}  ({b['direction']})*\n"
+            f"Notional: `${b['notional_usd']:,.0f}`\n"
+            f"Distance to liq: *{b['dist_pct']:.2f}%*  ({b['dist_source']})\n"
+            f"Vol-required distance: *{b['required_dist_pct']:.2f}%*\n"
+            f"Implied current leverage: `{b['implied_current_leverage']:.2f}x`    "
+            f"Recommended: *{b['recommended_leverage']:.2f}x*\n"
+            f"EWMA daily vol: `{b['ewma_vol_pct']:.2f}%`    "
+            f"Simple daily vol: `{b['simple_vol_pct']:.2f}%`    "
+            f"({b['n_returns']} returns, {b['vol_source']})"
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": fields_text}})
+        blocks.append({"type": "divider"})
+
+    payload = {"text": header, "blocks": blocks}
+
+    try:
+        resp = requests.post(
+            SLACK_WEBHOOK,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=TIMEOUT,
+        )
+        if resp.status_code != 200:
+            print(f"[Slack error] status={resp.status_code} body={resp.text}")
+        else:
+            print(f"Slack vol alert sent for {len(breaches)} position(s).")
+    except requests.RequestException as exc:
+        print(f"[Slack error] {exc}")
+
+    # ---- email mirror ----
+    subject = f"[Vol Warning] {len(breaches)} position(s) need lower leverage or more collateral"
+    rows_html = "".join(
+        f"<tr><td>{b['exchange']}</td><td>{b['symbol']}</td><td>{b['direction']}</td>"
+        f"<td align='right'>${b['notional_usd']:,.0f}</td>"
+        f"<td align='right'>{b['dist_pct']:.2f}%</td>"
+        f"<td align='right'><b>{b['required_dist_pct']:.2f}%</b></td>"
+        f"<td align='right'>{b['implied_current_leverage']:.2f}x</td>"
+        f"<td align='right'><b>{b['recommended_leverage']:.2f}x</b></td>"
+        f"<td align='right'>{b['ewma_vol_pct']:.2f}%</td></tr>"
+        for b in breaches
+    )
+    html = f"""
+    <h3>Volatility Leverage Warning &ndash; {ts}</h3>
+    <p>Distance-to-liq is inside the vol-implied safe distance
+    ({VOL_BUFFER_SIGMAS:.0f} weighted daily sigmas).
+    <b>Add collateral or reduce leverage</b> on these positions.</p>
+    <table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:monospace'>
+      <tr><th>Exchange</th><th>Symbol</th><th>Dir</th><th>Notional</th>
+          <th>Dist to Liq</th><th>Required Dist</th><th>Curr Lev</th><th>Rec Lev</th><th>EWMA Vol</th></tr>
+      {rows_html}
+    </table>
+    <p>Vol params: lookback={VOL_LOOKBACK_DAYS}d, halflife={VOL_HALFLIFE_DAYS}d,
+    buffer={VOL_BUFFER_SIGMAS} sigmas</p>
+    """
+    text = "\n".join(
+        f"{b['exchange']} {b['symbol']} {b['direction']} "
+        f"dist={b['dist_pct']:.2f}% required={b['required_dist_pct']:.2f}% "
+        f"currLev={b['implied_current_leverage']:.2f}x recLev={b['recommended_leverage']:.2f}x "
+        f"ewmaVol={b['ewma_vol_pct']:.2f}%"
+        for b in breaches
+    )
+    _send_email(subject, html, text)
 
 
 # ============================================================
@@ -827,6 +1188,28 @@ def _print_status(all_results: list[dict], okx_mgn_status: dict | None):
     print()
 
 
+def _print_vol_summary(breaches: list[dict]):
+    if not breaches:
+        print("All positions outside vol-implied required distance. No vol alerts fired.")
+        return
+    print(f"\n{'-'*108}")
+    print(f"  Vol-Implied Leverage Breaches  |  buffer: {VOL_BUFFER_SIGMAS:.0f} sigmas, "
+          f"lookback: {VOL_LOOKBACK_DAYS}d, halflife: {VOL_HALFLIFE_DAYS}d")
+    print(f"{'-'*108}")
+    print(
+        f"  {'Exchange':<14} {'Symbol':<16} {'Dir':<6} "
+        f"{'Dist':>8} {'Required':>9} {'EWMAVol':>8} {'CurrLev':>8} {'RecLev':>7}"
+    )
+    for b in breaches:
+        print(
+            f"  {b['exchange']:<14} {b['symbol']:<16} {b['direction']:<6} "
+            f"{b['dist_pct']:>7.2f}% {b['required_dist_pct']:>8.2f}% "
+            f"{b['ewma_vol_pct']:>7.2f}% {b['implied_current_leverage']:>7.2f}x "
+            f"{b['recommended_leverage']:>6.2f}x"
+        )
+    print()
+
+
 # ============================================================
 #  MAIN (single run, Jenkins-friendly)
 # ============================================================
@@ -888,6 +1271,20 @@ def run():
             f"OKX mgnRatio {okx_mgn_status['mgn_ratio']:.2f}x above floor "
             f"{OKX_MGN_RATIO_FLOOR:.2f}x. No OKX liquidation alert fired."
         )
+
+    # ---- vol-implied leverage check (independent of the fixed threshold) ----
+    try:
+        vol_input = list(all_results)
+        if VOL_TEST_POSITION:
+            print("  [vol check] TEST position injected: LAB LONG, dist=31.00% "
+                  "(vol-check input only; excluded from liq/delta alerts)")
+            vol_input.append(_make_test_position())
+        vol_breaches = check_vol_leverage(vol_input, okx_mgn_status)
+        _print_vol_summary(vol_breaches)
+        if vol_breaches:
+            _send_slack_vol_alert(vol_breaches)
+    except Exception as exc:
+        print(f"[Vol check error] {exc}")
 
     deltas = _compute_exchange_deltas(all_results)
     _print_delta_summary(deltas)
