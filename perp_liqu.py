@@ -403,16 +403,21 @@ def _check_hl_dex(dex: str) -> list[dict]:
         mark_px = mark_prices.get(coin)
         liq_px_str = pos.get("liquidationPx")
 
-        if not mark_px or not liq_px_str:
+        if not mark_px or mark_px == 0:
             continue
 
-        liq_px = float(liq_px_str)
-        if mark_px == 0:
-            continue
-
-        dist_pct = abs((mark_px - liq_px) / mark_px) * 100
         notional = abs(szi) * mark_px
         signed_notional = szi * mark_px
+
+        if liq_px_str:
+            liq_px = float(liq_px_str)
+            dist_pct = abs((mark_px - liq_px) / mark_px) * 100
+        else:
+            # cross position with no liq price (e.g. unified-account buffer so
+            # large HL reports none). Keep the row for delta aggregation and
+            # the status table; excluded from the fixed liq-threshold alert.
+            liq_px = None
+            dist_pct = None
 
         results.append({
             "exchange": "Hyperliquid",
@@ -1166,10 +1171,11 @@ def _print_status(all_results: list[dict], okx_mgn_status: dict | None):
 
     for r in sorted_results:
         if r.get("dist_pct") is None:
+            note = "(cross, see mgnRatio)" if r["exchange"] == "OKX" else "(cross, no liq px)"
             print(
                 f"  {r['exchange']:<14} {r['symbol']:<16} {r['direction']:<6} "
                 f"{r['size']:>14,.4f} ${r['notional_usd']:>14,.0f} "
-                f"{r['mark']:>12,.4f} {'--':>12} {'--':>8}  (cross, see mgnRatio)"
+                f"{r['mark']:>12,.4f} {'--':>12} {'--':>8}  {note}"
             )
         else:
             flag = " <<" if r["dist_pct"] < LIQ_THRESHOLD_PCT else ""
