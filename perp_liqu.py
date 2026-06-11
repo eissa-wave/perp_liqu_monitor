@@ -760,7 +760,7 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
 VOL_CHECK_ENABLED = True
 VOL_LOOKBACK_DAYS = 5
 VOL_HALFLIFE_DAYS = 1.0
-VOL_BUFFER_SIGMAS = 5.0
+VOL_BUFFER_SIGMAS = 4.0
 VOL_MMR = 0.0
 VOL_LEV_MIN = 1.0
 VOL_LEV_MAX = 5.0
