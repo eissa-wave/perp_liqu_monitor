@@ -937,22 +937,26 @@ def _get_vol_for_base(base: str, hl_symbol_hint: str | None, cache: dict) -> dic
     return out
 
 
-def _okx_implied_cross_dist(direction: str, mgn_ratio: float, pos_mmr: float,
-                            notional: float) -> float | None:
-    """Implied distance-to-liq for an OKX cross position, backed out from the
-    account mgnRatio and the position's maintenance rate m = mmr/notional.
-    Single-position closed form; with multiple cross positions sharing the
-    account it is an approximation (shared adjEq/mmr pool).
-      long:  dist = m*(R-1)/(1-m)
-      short: dist = m*(R-1)/(1+m)"""
-    if mgn_ratio <= 1.0 or notional <= 0 or pos_mmr <= 0:
+def _okx_implied_cross_dist(direction: str, mgn_ratio: float, acct_mmr: float,
+                            pos_mmr: float, notional: float) -> float | None:
+    """Implied distance-to-liq for an OKX cross position, holding other
+    positions static. The account liquidates when this position's adverse PnL
+    consumes the shared buffer adjEq - mmr_total = mmr_total*(R-1), with the
+    position's own mmr scaling with its notional as price moves:
+      short: dist = mmr_total*(R-1) / (notional * (1 + m_i))
+      long:  dist = mmr_total*(R-1) / (notional * (1 - m_i))
+    where m_i = pos_mmr/notional. Uses ACCOUNT mmr in the numerator: the whole
+    buffer absorbs the move, so small positions sharing the pool with a large
+    one have very large implied distances."""
+    if mgn_ratio <= 1.0 or notional <= 0 or acct_mmr <= 0:
         return None
-    m = pos_mmr / notional
-    if m >= 1.0:
+    m_i = (pos_mmr / notional) if pos_mmr > 0 else 0.0
+    if m_i >= 1.0:
         return None
+    buffer_usd = acct_mmr * (mgn_ratio - 1.0)
     if direction == "LONG":
-        return m * (mgn_ratio - 1.0) / (1.0 - m) * 100.0
-    return m * (mgn_ratio - 1.0) / (1.0 + m) * 100.0
+        return buffer_usd / (notional * (1.0 - m_i)) * 100.0
+    return buffer_usd / (notional * (1.0 + m_i)) * 100.0
 
 
 def check_vol_leverage(all_results: list[dict], okx_mgn_status: dict | None) -> list[dict]:
@@ -978,7 +982,8 @@ def check_vol_leverage(all_results: list[dict], okx_mgn_status: dict | None) -> 
         if dist_pct is None and r["exchange"] == "OKX" and okx_mgn_status:
             pos_mmr = r.get("pos_mmr") or 0.0
             dist_pct = _okx_implied_cross_dist(
-                r["direction"], okx_mgn_status["mgn_ratio"], pos_mmr, r["notional_usd"]
+                r["direction"], okx_mgn_status["mgn_ratio"], okx_mgn_status["mmr"],
+                pos_mmr, r["notional_usd"]
             )
             dist_source = "implied from OKX mgnRatio (approx)"
 
