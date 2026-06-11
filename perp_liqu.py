@@ -766,7 +766,7 @@ VOL_SYMBOL_OVERRIDES = {}
 # Set to False (or env VOL_TEST_POSITION=0) once verified. LAB at a fake 31%
 # distance-to-liq: passes the fixed 25% threshold but should breach the
 # vol-implied required distance if LAB's recent vol is high enough.
-VOL_TEST_POSITION = 1
+VOL_TEST_POSITION = 0
 
 
 def _make_test_position() -> dict:
