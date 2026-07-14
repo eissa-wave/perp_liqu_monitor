@@ -39,6 +39,11 @@ OKX_BASE = "https://www.okx.com"
 # 1.33 ~= 25% equity buffer above mmr.
 OKX_MGN_RATIO_FLOOR = 1.4
 
+LIGHTER_BASE_URL = os.environ.get("LIGHTER_BASE_URL", "https://mainnet.zklighter.elliot.ai")
+# Account/position data on Lighter is public (query by account index, no API
+# key or request signing needed). Leave unset to skip Lighter entirely.
+LIGHTER_ACCOUNT_INDEX = os.environ.get("LIGHTER_ACCOUNT_INDEX")
+
 SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK")
 
 # Email config
@@ -748,6 +753,74 @@ def check_okx_liquidations() -> tuple[list[dict], dict | None]:
 
 
 # ============================================================
+#  LIGHTER
+# ============================================================
+def check_lighter_liquidations() -> list[dict]:
+    """Lighter is a zk-rollup orderbook perp DEX. Account/position data is
+    public (GET /api/v1/account?by=index&value=<account index>), so no API key
+    or request signing is needed -- just LIGHTER_ACCOUNT_INDEX.
+
+    Lighter returns a per-position liquidation_price even for cross-margin
+    positions, so every position participates in the fixed liq-threshold
+    check, the vol check, and delta aggregation like an isolated position on
+    the other venues. Mark price is derived as position_value / size (the
+    endpoint doesn't return mark directly)."""
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    r = requests.get(
+        f"{LIGHTER_BASE_URL}/api/v1/account",
+        params={"by": "index", "value": LIGHTER_ACCOUNT_INDEX, "active_only": "true"},
+        timeout=TIMEOUT,
+    )
+    r.raise_for_status()
+    accounts = r.json().get("accounts") or []
+    acct = accounts[0] if accounts else {}
+
+    results = []
+    for p in (acct.get("positions") or []):
+        size = abs(_f(p.get("position")))
+        if size == 0:
+            continue
+
+        sign_val = 1 if int(p.get("sign", 1) or 1) >= 0 else -1
+        direction = "LONG" if sign_val > 0 else "SHORT"
+        pos_value = abs(_f(p.get("position_value")))
+        mark = pos_value / size if size > 0 else 0.0
+        if mark == 0:
+            continue
+
+        signed_notional = sign_val * pos_value
+
+        liq_raw = p.get("liquidation_price")
+        liq_px = _f(liq_raw) if liq_raw not in (None, "") else 0.0
+        if liq_px > 0:
+            liq_out = liq_px
+            dist_pct = abs((mark - liq_px) / mark) * 100
+        else:
+            liq_out = None
+            dist_pct = None
+
+        results.append({
+            "exchange": "Lighter",
+            "symbol": p.get("symbol", ""),
+            "direction": direction,
+            "size": size,
+            "notional_usd": pos_value,
+            "signed_notional_usd": signed_notional,
+            "mark": mark,
+            "liq": liq_out,
+            "dist_pct": dist_pct,
+        })
+
+    return results
+
+
+# ============================================================
 #  VOLATILITY-BASED LEVERAGE CHECK
 # ============================================================
 # Independent of the fixed LIQ_THRESHOLD_PCT check above. For each position we
@@ -1259,6 +1332,14 @@ def run():
             print(f"[OKX error] {exc}")
     else:
         print("  (OKX skipped, no API key configured)")
+
+    if LIGHTER_ACCOUNT_INDEX:
+        try:
+            all_results += check_lighter_liquidations()
+        except Exception as exc:
+            print(f"[Lighter error] {exc}")
+    else:
+        print("  (Lighter skipped, no LIGHTER_ACCOUNT_INDEX configured)")
 
     _print_status(all_results, okx_mgn_status)
 
